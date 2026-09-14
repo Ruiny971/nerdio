@@ -20,11 +20,16 @@ scripted-actions/
 └── lab/
     ├── windows/
     └── runbook/
+
+tools/              # Standalone scripts - NOT NME Scripted Actions.
+                     # Run manually (e.g. locally, or RDP'd into a VM), not imported into NME.
 ```
 
 ## Usage
 
-Each script includes an NME-compatible variable block at the top. Copy the script content directly into NME as a new Scripted Action, or reference this repo via NME's GitHub integration.
+Scripts under `scripted-actions/` include an NME-compatible variable block at the top. Copy the script content directly into NME as a new Scripted Action, or reference this repo via NME's GitHub integration.
+
+Scripts under `tools/` are standalone - run them directly with PowerShell, not through NME.
 
 ## Related
 
