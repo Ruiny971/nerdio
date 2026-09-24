@@ -1,14 +1,18 @@
-#description: Sets the OS time zone on a session host. Run against a single VM or a whole host pool from NME's scripted actions.
+#description: Sets the OS time zone on a session host. Run against a single VM or a whole host pool from NME's scripted actions. No restart required - Set-TimeZone applies immediately; users just need to log off/back on to see it in their session.
 #execution mode: Individual
 #tags: Windows, AVD, TimeZone
 
-<#
-$TimeZoneId must match a valid Windows time zone ID exactly (case-sensitive lookup is not required,
-but spelling is). Run `tzutil /l` on any Windows box to list valid IDs, e.g.:
-  "Eastern Standard Time", "Pacific Standard Time", "GMT Standard Time", "W. Europe Standard Time"
+<#variables:
+{
+  "TimeZoneId": {
+    "Description": "Exact Windows time zone ID (run 'tzutil /l' on any Windows box to list valid IDs), e.g. Romance Standard Time, Eastern Standard Time, GMT Standard Time, W. Europe Standard Time",
+    "DisplayName": "Time Zone ID"
+  }
+}
 #>
+
 param(
-    [string]$TimeZoneId = 'Eastern Standard Time'
+    [string]$TimeZoneId = 'Romance Standard Time'
 )
 
 $ErrorActionPreference = 'Stop'
