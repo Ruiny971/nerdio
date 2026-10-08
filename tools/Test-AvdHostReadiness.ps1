@@ -91,6 +91,13 @@
 .PARAMETER SkipImageBuildEndpoints
     Skips the optional "Image build" group (github.com and similar).
 
+.PARAMETER ExcludeSensitiveData
+    Leaves the two most identifying items out of the ZIP: the gpresult HTML report (user and computer names,
+    SIDs, group memberships, OU paths, every applied policy setting) and the full dsregcmd output (tenant ID,
+    device ID, user principal name). Only the join-state lines of dsregcmd are kept. The transcript still
+    contains the computer name, the signed-in user name and the Defender exclusion paths. Use this when the
+    ZIP will leave the customer's organisation and the GPO detail is not needed.
+
 .EXAMPLE
     .\Test-AvdHostReadiness.ps1
     Runs the policy diagnostic only (including WinRM and proxy checks), outputs to C:\Temp.
@@ -108,10 +115,36 @@
     .\Test-AvdHostReadiness.ps1 -TestConnectivity -SkipImageBuildEndpoints -OutputPath "$env:USERPROFILE\Desktop"
     Skips the optional image build endpoints and writes output to the current user's Desktop.
 
+.EXAMPLE
+    Unblock-File .\Test-AvdHostReadiness.ps1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-AvdHostReadiness.ps1 -TestConnectivity -ExcludeSensitiveData
+    Recommended first run, from an elevated Windows PowerShell 5.1 prompt on the VM (see NOTES).
+
 .NOTES
     Requires PowerShell 5.1+ (Windows PowerShell 5.1 or PowerShell 7) and local Administrator rights.
     The script reads state only and does not modify the VM. Every network test
     and external tool call has a timeout.
+
+    Running it:
+      - Run it ELEVATED. Without elevation the Microsoft URL tool cannot talk to the RDAgent service ("Access to
+        the named pipe is denied"), 168.63.129.16 and 169.254.169.254 cannot be reached, and gpresult and
+        Defender return partial data. The script says so, but the results are then incomplete.
+      - Prefer Windows PowerShell 5.1 (powershell.exe): it is what scripted actions use, and the policy and
+        language-mode results then describe the right engine. In PowerShell 7 the script reads the Windows
+        PowerShell 5.1 execution policy separately, and Get-AppLockerPolicy goes through the Windows
+        PowerShell compatibility layer, which itself needs WinRM.
+      - A file downloaded from the internet carries a "Zone.Identifier" mark and is blocked under RemoteSigned
+        with "...is not digitally signed". Run Unblock-File on it first, or start it with
+        powershell.exe -ExecutionPolicy Bypass -File (a Process-scope setting does not hide the real
+        policy: the script ignores Process scope when it reports the execution policy).
+      - Public Azure cloud only. The endpoint lists, and Microsoft's URL tool, do not cover Azure
+        Government or other sovereign clouds.
+
+    The ZIP contains: the transcript (computer name, signed-in user name, Defender exclusion paths, local
+    firewall and service state), the gpresult HTML report, dsregcmd output (tenant ID, device ID, user
+    principal name), AppLocker XML, and with -TestConnectivity the connectivity CSV and the URL tool output
+    (resolved IP addresses, certificate subjects and issuers, any storage account names you passed in).
+    Review it before sending it outside the organisation, or use -ExcludeSensitiveData.
 
     If the script cannot run at all:
       - "File ... cannot be loaded. The file is not digitally signed" means the
@@ -131,7 +164,8 @@ param(
     [string]$OutputPath = "C:\Temp",
     [string]$FslogixStorageFqdn,
     [string]$CssaStorageFqdn,
-    [switch]$SkipImageBuildEndpoints
+    [switch]$SkipImageBuildEndpoints,
+    [switch]$ExcludeSensitiveData
 )
 
 $ErrorActionPreference = 'Continue'
@@ -217,7 +251,15 @@ function Invoke-ExternalTool {
             PassThru               = $true
             ErrorAction            = 'Stop'
         }
-        if ($Arguments.Count -gt 0) { $sp.ArgumentList = $Arguments }
+        # Start-Process joins an array with single spaces and adds NO quotes (Windows PowerShell 5.1 and
+        # PowerShell 7), so an argument containing a space would be split. Build one string and quote
+        # any argument that has whitespace or a quote in it (Microsoft: "use a single ArgumentList value").
+        if ($Arguments.Count -gt 0) {
+            $quoted = foreach ($a in $Arguments) {
+                if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
+            }
+            $sp.ArgumentList = ($quoted -join ' ')
+        }
         if ($WorkingDirectory)      { $sp.WorkingDirectory = $WorkingDirectory }
         $proc = Start-Process @sp
         $result.Started = $true
@@ -313,7 +355,13 @@ New-Obj ([ordered]@{
 
 Write-SubSection "Azure AD join state (dsregcmd)"
 $dsreg = Invoke-ExternalTool -FilePath "dsregcmd.exe" -Arguments @('/status') -TimeoutSeconds 60
-Write-ToolResult -Tool $dsreg -Name "dsregcmd"
+if ($ExcludeSensitiveData -and $dsreg.Output) {
+    Write-Host "(-ExcludeSensitiveData: only the join-state lines are kept; tenant, device and user identifiers are left out.)"
+    ($dsreg.Output -split "\r?\n" | Where-Object { $_ -match '^\s*(AzureAdJoined|EnterpriseJoined|DomainJoined|DeviceAuthStatus|NgcSet|AzureAdPrt|WorkplaceJoined|MDMUrl)\s*:' } |
+        ForEach-Object { $_ -replace '(MDMUrl\s*:).*', '$1 (hidden, present or absent only)' }) -join "`n"
+} else {
+    Write-ToolResult -Tool $dsreg -Name "dsregcmd"
+}
 
 Write-SubSection "Pending reboot indicators"
 Write-Host "If any of these are TRUE, some queries below may return stale state."
@@ -374,10 +422,14 @@ if ($tls12Blocked) {
 Write-SubSection "Windows activation"
 Write-Host "Windows on Azure activates against azkms.core.windows.net / kms.core.windows.net on TCP 1688."
 try {
-    $lic = Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop |
-        Select-Object -First 1
+    # Add-ons such as Extended Security Updates share the Windows application ID, so look at every product with a
+    # partial key and ignore those add-ons rather than trusting whichever comes first.
+    $licAll = @(Get-CimInstance -ClassName SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop |
+        Where-Object { $_.Name -notmatch 'ESU|Extended Security' })
+    $lic = $licAll | Where-Object { $_.LicenseStatus -eq 1 } | Select-Object -First 1
+    if (-not $lic) { $lic = $licAll | Select-Object -First 1 }
     if ($lic) {
-        $lic | Select-Object Name, LicenseStatus, KeyManagementServiceMachine, DiscoveredKeyManagementServiceMachineName | Format-List
+        $licAll | Select-Object Name, LicenseStatus, KeyManagementServiceMachine, DiscoveredKeyManagementServiceMachineName | Format-List
         Write-Host "LicenseStatus key: 0=Unlicensed, 1=Licensed, 2=OOBGrace, 3=OOTGrace, 4=NonGenuineGrace, 5=Notification, 6=ExtendedGrace"
         if ($lic.LicenseStatus -eq 1) {
             Add-Result -Area 'System' -Check 'Windows activation' -Status 'PASS' -Detail 'Licensed.'
@@ -553,7 +605,17 @@ if ($lang -ne 'FullLanguage') {
 } else {
     Write-Host "Note: this is the language mode of THIS session. Scripts run by the Custom Script Extension"
     Write-Host "run as SYSTEM and can be treated differently by WDAC, so confirm with the policy owner."
-    Add-Result -Area 'Policy' -Check 'PowerShell language mode' -Status 'PASS' -Detail 'FullLanguage in this session.'
+    # A script that WDAC allows runs in FullLanguage, while an unsigned script from the extension can be forced
+    # into Constrained Language Mode. So a FullLanguage session is only reassuring if WDAC is not enforcing.
+    $umci = $null
+    try { $umci = (Get-CimInstance -ClassName Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction Stop).UserModeCodeIntegrityPolicyEnforcementStatus } catch {}
+    if ($umci -eq 2) {
+        Write-Host "WARNING: user-mode code integrity (WDAC) is ENFORCED on this VM. This script was allowed to run in FullLanguage,"
+        Write-Host "but unsigned scripts from NME may not be. Test a real scripted action, or ask the WDAC owner about script enforcement."
+        Add-Result -Area 'Policy' -Check 'PowerShell language mode' -Status 'WARN' -Detail 'FullLanguage in this session, but WDAC user-mode code integrity is enforced; NME scripts may be forced into Constrained Language Mode.'
+    } else {
+        Add-Result -Area 'Policy' -Check 'PowerShell language mode' -Status 'PASS' -Detail $(if ($null -eq $umci) { 'FullLanguage in this session (WDAC enforcement state could not be read).' } else { 'FullLanguage in this session; WDAC user-mode code integrity is not enforced.' })
+    }
 }
 
 Write-SubSection "Active WDAC policies (CiTool)"
@@ -577,37 +639,74 @@ if ($ciEvents) {
 # ---------- 6. PowerShell Execution Policy ----------
 Write-Section "6. PowerShell Execution Policy"
 Write-SubSection "Per-scope policy"
-$epList = Get-ExecutionPolicy -List
+$epList = @(Get-ExecutionPolicy -List | ForEach-Object { New-Obj ([ordered]@{ Scope = "$($_.Scope)"; ExecutionPolicy = "$($_.ExecutionPolicy)" }) })
+$epSource = "this session ($($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion))"
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    # PowerShell 7 keeps its own LocalMachine / CurrentUser policy. NME's Custom Script Extension launches
+    # Windows PowerShell (powershell.exe), so read that edition's policy instead.
+    $wp = Invoke-ExternalTool -FilePath 'powershell.exe' -Arguments @('-NoProfile', '-NonInteractive', '-Command', "Get-ExecutionPolicy -List | ForEach-Object { '{0}={1}' -f `$_.Scope, `$_.ExecutionPolicy }") -TimeoutSeconds 30
+    $parsed = @()
+    foreach ($line in ($wp.Output -split "\r?\n")) { if ($line -match '^(\w+)=(\w+)$') { $parsed += New-Obj ([ordered]@{ Scope = $Matches[1]; ExecutionPolicy = $Matches[2] }) } }
+    if ($parsed.Count -ge 4) {
+        Write-Host "Running in PowerShell 7; the table below is the policy for Windows PowerShell 5.1 (powershell.exe), which is what"
+        Write-Host "scripted actions use. PowerShell 7's own policy is shown first for reference."
+        $epList | Format-Table -AutoSize
+        $epList = $parsed
+        $epSource = 'Windows PowerShell 5.1 (powershell.exe)'
+    } else {
+        Write-Host "Could not read the Windows PowerShell 5.1 policy from PowerShell 7; the values below are PowerShell 7's own."
+    }
+}
 $epList | Format-Table -AutoSize
 
-# Get-ExecutionPolicy (no -List) honours a Process-scope override such as
-# "-ExecutionPolicy Bypass", which would hide the real machine setting. Work it out
-# ourselves in precedence order, skipping Process.
-$effective = 'Undefined'
-foreach ($scope in 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine') {
-    $entry = $epList | Where-Object { "$($_.Scope)" -eq $scope } | Select-Object -First 1
-    if ($entry -and "$($entry.ExecutionPolicy)" -ne 'Undefined') { $effective = "$($entry.ExecutionPolicy)"; $effectiveScope = $scope; break }
+# Get-ExecutionPolicy (no -List) honours a Process-scope override such as "-ExecutionPolicy Bypass",
+# which would hide the real machine setting, so work it out in precedence order and skip Process.
+# Per Microsoft (about_Execution_Policies): Group Policy (MachinePolicy, UserPolicy) overrides every other
+# scope, including a -ExecutionPolicy parameter; otherwise Process > CurrentUser > LocalMachine.
+function Get-EpScope { param([string]$Scope) $e = $epList | Where-Object { $_.Scope -eq $Scope } | Select-Object -First 1; if ($e) { return $e.ExecutionPolicy } else { return 'Undefined' } }
+$gpPolicy = $null; $gpScope = $null
+foreach ($scope in 'MachinePolicy', 'UserPolicy') {
+    $v = Get-EpScope $scope
+    if ($v -ne 'Undefined') { $gpPolicy = $v; $gpScope = $scope; break }
 }
-if ($effective -eq 'Undefined') { $effective = 'Restricted'; $effectiveScope = 'default (Windows client default)'; if ((Get-CimInstance Win32_OperatingSystem).ProductType -ne 1) { $effective = 'RemoteSigned'; $effectiveScope = 'default (Windows Server default)' } }
-$processScope = $epList | Where-Object { "$($_.Scope)" -eq 'Process' } | Select-Object -First 1
-Write-Host "Effective policy (ignoring Process scope): $effective  [from $effectiveScope]"
-Write-Host "Reported by Get-ExecutionPolicy:            $(Get-ExecutionPolicy)"
+$localPolicy = $null; $localScope = $null
+foreach ($scope in 'CurrentUser', 'LocalMachine') {
+    $v = Get-EpScope $scope
+    if ($v -ne 'Undefined') { $localPolicy = $v; $localScope = $scope; break }
+}
+$processPolicy = Get-EpScope 'Process'
+Write-Host "Policy source: $epSource"
+Write-Host ("Group Policy (MachinePolicy / UserPolicy): {0}" -f $(if ($gpPolicy) { "$gpPolicy (from $gpScope)" } else { 'not set' }))
+Write-Host ("CurrentUser / LocalMachine:                {0}" -f $(if ($localPolicy) { "$localPolicy (from $localScope)" } else { 'not set in any scope' }))
+Write-Host "Reported by Get-ExecutionPolicy in this session: $(Get-ExecutionPolicy)"
+
+# FAIL only where nothing the launcher can pass on its command line is able to override the policy: Group Policy.
+# A restrictive CurrentUser / LocalMachine value (or no value at all, when the Windows client default of Restricted
+# applies) is only a WARN, because a launcher that starts powershell.exe with -ExecutionPolicy overrides it. Whether
+# NME's Custom Script Extension command does that could not be confirmed from Nerdio's or Microsoft's documentation.
+$restrictive = 'AllSigned', 'Restricted'
 $epStatus = 'PASS'
-$epDetail = "$effective (from $effectiveScope)."
-if ($effective -in 'AllSigned', 'Restricted') {
-    Write-Host ""
-    Write-Host "WARNING: Effective execution policy is $effective."
-    Write-Host "Unsigned PowerShell will be blocked. NME scripted actions will fail unless"
-    Write-Host "scripts are signed with a certificate trusted on this VM."
+if ($gpPolicy -and ($gpPolicy -in $restrictive)) {
     $epStatus = 'FAIL'
-    $epDetail = "$effective (from $effectiveScope). Unsigned scripts are blocked."
+    $epDetail = "Group Policy ($gpScope) sets $gpPolicy. Group Policy beats any -ExecutionPolicy flag, so unsigned scripts are blocked. Sign the scripts (NME script signing) or change the GPO."
+    Write-Host ""; Write-Host "WARNING: $epDetail"
+} elseif ($gpPolicy) {
+    $epDetail = "Group Policy ($gpScope) sets $gpPolicy; not restrictive."
+} elseif ($localPolicy -and ($localPolicy -in $restrictive)) {
+    $epStatus = 'WARN'
+    $epDetail = "$localPolicy from $localScope (not Group Policy). Blocks unsigned scripts unless the launcher passes -ExecutionPolicy, which could not be confirmed for NME. The Nerdio KB says unsigned scripts must be able to run."
+    Write-Host ""; Write-Host "WARNING: $epDetail"
+} elseif ($localPolicy) {
+    $epDetail = "$localPolicy from $localScope; not restrictive."
+} else {
+    $epDetail = 'No policy set in any scope. The PowerShell default applies (Restricted on Windows clients, RemoteSigned on servers, per Microsoft); a launcher using -ExecutionPolicy overrides it. Information only.'
+    Write-Host ""; Write-Host "INFO: $epDetail"
 }
-if ($processScope -and "$($processScope.ExecutionPolicy)" -ne 'Undefined') {
+if ($processPolicy -ne 'Undefined') {
     Write-Host ""
-    Write-Host "NOTE: a Process-scope policy ($($processScope.ExecutionPolicy)) is set for this session, so this script"
-    Write-Host "      may have run despite the policy above. NME runs its scripts in its own sessions."
-    if ($epStatus -eq 'PASS') { $epStatus = 'WARN' }
-    $epDetail += " Process-scope override ($($processScope.ExecutionPolicy)) was in use for this run."
+    Write-Host "NOTE: a Process-scope policy ($processPolicy) is set for this session (for example from -ExecutionPolicy Bypass),"
+    Write-Host "      so this script may have run despite the settings above. It is not counted in the result."
+    $epDetail += " (This run used a Process-scope $processPolicy override, which is ignored here.)"
 }
 Add-Result -Area 'Policy' -Check 'Execution policy' -Status $epStatus -Detail $epDetail
 
@@ -666,20 +765,25 @@ if ($lsa) {
 
 # ---------- 9. Group Policy ----------
 Write-Section "9. Group Policy report"
-Write-Host "Generating gpresult HTML report (this may take 30-60 seconds, 3 minute limit)..."
-# gpresult rejects output paths longer than 127 characters, so write to a short temp path and copy.
-$gpTemp = Join-Path $env:TEMP ("avdhr_gpo_{0}.html" -f (Get-Random))
-$gp = Invoke-ExternalTool -FilePath "gpresult.exe" -Arguments @('/h', $gpTemp, '/f') -TimeoutSeconds 180
-Write-ToolResult -Tool $gp -Name "gpresult"
-if (Test-Path $gpTemp) {
-    Copy-Item -Path $gpTemp -Destination $gpoFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $gpTemp -Force -ErrorAction SilentlyContinue
-}
-if (Test-Path $gpoFile) {
-    Write-Host "GPO report saved to: $gpoFile"
-    Write-Host "Size: $((Get-Item $gpoFile).Length) bytes"
+if ($ExcludeSensitiveData) {
+    Write-Host "Skipped (-ExcludeSensitiveData): the gpresult HTML report lists user and computer names, SIDs,"
+    Write-Host "group memberships, OU paths and every applied policy setting."
 } else {
-    Write-Host "gpresult did not produce an output file."
+    Write-Host "Generating gpresult HTML report (this may take 30-60 seconds, 3 minute limit)..."
+    # gpresult rejects output paths longer than 127 characters, so write to a short temp path and copy.
+    $gpTemp = Join-Path $env:TEMP ("avdhr_gpo_{0}.html" -f (Get-Random))
+    $gp = Invoke-ExternalTool -FilePath "gpresult.exe" -Arguments @('/h', $gpTemp, '/f') -TimeoutSeconds 180
+    Write-ToolResult -Tool $gp -Name "gpresult"
+    if (Test-Path $gpTemp) {
+        Copy-Item -Path $gpTemp -Destination $gpoFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $gpTemp -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $gpoFile) {
+        Write-Host "GPO report saved to: $gpoFile"
+        Write-Host "Size: $((Get-Item $gpoFile).Length) bytes"
+    } else {
+        Write-Host "gpresult did not produce an output file."
+    }
 }
 
 # ---------- 10. Local firewall ----------
@@ -707,20 +811,29 @@ if ($winrmSvc) {
 
 Write-SubSection "Test-WSMan localhost (30 second limit)"
 $wsmanOk = $false
+$wsmanRan = $false
+$wsmanCouldNotRun = $false
 $wsmanText = ''
-try {
-    $job = Start-Job -ScriptBlock {
-        try { Test-WSMan -ComputerName localhost -ErrorAction Stop | Out-String } catch { "ERROR: " + $_.Exception.Message }
+if ($winrmSvc -and $winrmSvc.Status -eq 'Running') {
+    $wsmanRan = $true
+    try {
+        $job = Start-Job -ScriptBlock {
+            try { Test-WSMan -ComputerName localhost -ErrorAction Stop | Out-String } catch { "ERROR: " + $_.Exception.Message }
+        }
+        if (Wait-Job -Job $job -Timeout 30) {
+            $wsmanText = (Receive-Job -Job $job | Out-String).Trim()
+            $wsmanOk = ($wsmanText -and $wsmanText -notmatch '^ERROR:')
+        } else {
+            $wsmanText = 'ERROR: Test-WSMan did not respond within 30 seconds.'
+        }
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    } catch {
+        $wsmanRan = $false
+        $wsmanCouldNotRun = $true
+        $wsmanText = "Test-WSMan could not be run in this session (a background job could not be started): $($_.Exception.Message)"
     }
-    if (Wait-Job -Job $job -Timeout 30) {
-        $wsmanText = (Receive-Job -Job $job | Out-String).Trim()
-        $wsmanOk = ($wsmanText -and $wsmanText -notmatch '^ERROR:')
-    } else {
-        $wsmanText = 'ERROR: Test-WSMan did not respond within 30 seconds.'
-    }
-    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-} catch {
-    $wsmanText = "ERROR: could not start the Test-WSMan check: $($_.Exception.Message)"
+} else {
+    $wsmanText = 'Not run: the WinRM service is not running. That is normal on Windows client builds, where it is Manual by default and starts on demand.'
 }
 Write-Host $wsmanText
 
@@ -746,10 +859,13 @@ if (-not $winrmSvc) {
     $winrmStatus = 'FAIL'; $winrmDetail = 'WinRM service start type is Disabled.'
 } elseif ($winrmPolicyIssue) {
     $winrmStatus = 'WARN'; $winrmDetail = "Service $($winrmSvc.Status) / $($winrmSvc.StartType), but a policy disables WinRM remote management."
-} elseif ($winrmSvc.Status -ne 'Running') {
-    $winrmStatus = 'WARN'; $winrmDetail = "Service is $($winrmSvc.Status) (start type $($winrmSvc.StartType)). Not disabled, but not running now."
+} elseif ($wsmanCouldNotRun) {
+    $winrmStatus = 'WARN'; $winrmDetail = "Service is $($winrmSvc.Status) ($($winrmSvc.StartType)) and not disabled, but Test-WSMan localhost could not be run in this session, so the listener was not checked."
+} elseif (-not $wsmanRan) {
+    # Not disabled is all the Nerdio KB asks for. Manual / Stopped is the Windows client default, so no warning.
+    $winrmDetail = "Service is $($winrmSvc.Status) with start type $($winrmSvc.StartType). Not disabled, which is what the Nerdio KB requires."
 } elseif (-not $wsmanOk) {
-    $winrmStatus = 'WARN'; $winrmDetail = "Service running ($($winrmSvc.StartType)) but Test-WSMan localhost failed or timed out."
+    $winrmStatus = 'WARN'; $winrmDetail = "Service running ($($winrmSvc.StartType)) but Test-WSMan localhost failed or timed out, so there may be no listener."
 } else {
     $winrmDetail = "Service running ($($winrmSvc.StartType)), Test-WSMan localhost succeeded."
 }
@@ -996,6 +1112,30 @@ if ($TestConnectivity) {
     $gImage   = 'Image build (only needed if building images with Nerdio scripted actions)'
     $gStorage = 'Customer storage'
 
+    # Parses WVDAgentUrlTool.exe output. Microsoft documents the output only as screenshots; the structure used here
+    # (header banner, "UrlsAccessibleCheck : Outcome: ...", "Accessible URLs:" and "NOT Accessible URLs:" sections of
+    # host names, "<empty>" for an empty section, "Acquired on:" footer) comes from published transcripts, and the
+    # "failed with: ..." line from a real failed run. Anything else leaves Recognised = $false, never a PASS.
+    function ConvertFrom-UrlToolOutput {
+        param([string]$Text)
+        $r = New-Obj ([ordered]@{ Accessible = @(); NotAccessible = @(); HasAccessibleSection = $false; HasNotAccessibleSection = $false; Outcome = ''; ToolError = ''; Recognised = $false })
+        $section = $null
+        foreach ($line in ($Text -split "\r?\n")) {
+            $l = $line.Trim()
+            if (-not $l) { continue }
+            if ($l -match '^NOT\s+Accessible\s+URLs?\s*:?$') { $section = 'no';  $r.HasNotAccessibleSection = $true; continue }
+            if ($l -match '^Accessible\s+URLs?\s*:?$')       { $section = 'yes'; $r.HasAccessibleSection = $true; continue }
+            if ($l -match 'Outcome:\s*(\w+)')                { $r.Outcome = $Matches[1]; continue }
+            if ($l -match 'failed with:?\s*(.+)$')           { $r.ToolError = $Matches[1].Trim(); $section = $null; continue }
+            if ($l -match '^=+$' -or $l -eq '<empty>' -or $l -match '^Acquired on' -or $l -match '^Additional Contextual') { continue }
+            if ($section -and $l -match '^([a-z0-9*][a-z0-9.\-*_]*(\.[a-z0-9\-]+)+)(:\d+)?(/\S*)?$') {
+                if ($section -eq 'yes') { $r.Accessible += $Matches[1] } else { $r.NotAccessible += $Matches[1] }
+            }
+        }
+        $r.Recognised = ($r.HasAccessibleSection -and $r.HasNotAccessibleSection)
+        return $r
+    }
+
     # --- 13a. Microsoft's Azure Virtual Desktop Agent URL Tool -------------------
     Write-SubSection "13a. Microsoft Azure Virtual Desktop Agent URL Tool (WVDAgentUrlTool.exe)"
     Write-Host "Documented requirements: RDAgent 1.0.2944.400 or later, .NET Framework 4.6.2, and"
@@ -1034,40 +1174,34 @@ if ($TestConnectivity) {
         Write-Host ("Exit code: {0}   Timed out: {1}" -f $tool.ExitCode, $tool.TimedOut)
         $toolText | Out-File -FilePath (Join-Path $workDir 'wvdagenturltool_output.txt') -Encoding utf8
 
-        # The output format is not documented, so classify by keywords and keep the raw file as the source of truth.
-        $accessible = @(); $inaccessible = @(); $mode = $null
-        foreach ($line in ($toolText -split "\r?\n")) {
-            $l = $line.Trim()
-            if (-not $l) { continue }
-            $hasHost = $l -match '([a-z0-9*][a-z0-9.\-*]*\.[a-z]{2,}|\b\d{1,3}(\.\d{1,3}){3}\b)'
-            $neg = $l -match 'not accessible|inaccessible|not reachable|unreachable|cannot (be )?(reach|access)|unable to|failed|blocked|denied|timed out|error'
-            $pos = $l -match '\baccessible\b|\breachable\b|success|\bpassed\b|\bOK\b'
-            if ($neg)      { if ($hasHost) { $inaccessible += $l } else { $mode = 'neg' }; continue }
-            if ($pos)      { if ($hasHost) { $accessible += $l }   else { $mode = 'pos' }; continue }
-            if ($hasHost)  { if ($mode -eq 'neg') { $inaccessible += $l } elseif ($mode -eq 'pos') { $accessible += $l } }
-        }
+        $pr = ConvertFrom-UrlToolOutput -Text $toolText
         Write-Host ""
-        Write-Host ("Summary: {0} accessible line(s), {1} NOT accessible line(s) (keyword based; see wvdagenturltool_output.txt)." -f $accessible.Count, $inaccessible.Count)
-        if ($inaccessible.Count -gt 0) { Write-Host "NOT accessible:"; $inaccessible | ForEach-Object { Write-Host "  $_" } }
-        if ($accessible.Count -gt 0)   { Write-Host "Accessible:";     $accessible   | ForEach-Object { Write-Host "  $_" } }
+        Write-Host ("Summary: {0} accessible URL(s), {1} NOT accessible URL(s). Outcome: {2}" -f $pr.Accessible.Count, $pr.NotAccessible.Count, $(if ($pr.Outcome) { $pr.Outcome } else { 'not reported' }))
+        if ($pr.NotAccessible.Count -gt 0) { Write-Host "NOT accessible:"; $pr.NotAccessible | ForEach-Object { Write-Host "  $_" } }
+        if ($pr.Accessible.Count -gt 0)    { Write-Host "Accessible:";     $pr.Accessible    | ForEach-Object { Write-Host "  $_" } }
+        if ($pr.ToolError)                 { Write-Host "Tool error: $($pr.ToolError)" }
 
+        $hint = ''
+        if ($toolText -match 'named pipe' -or -not $isAdmin) { $hint = ' It talks to the RDAgent service, so run it elevated with the agent service running.' }
         if ($tool.TimedOut) {
             Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'WARN' -Detail 'WVDAgentUrlTool.exe did not finish within 120 seconds and was stopped. Result inconclusive.'
         } elseif (-not $tool.Started) {
             Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'WARN' -Detail "WVDAgentUrlTool.exe could not be started: $($tool.Error). Fell back to the script's own list."
-        } elseif ($inaccessible.Count -gt 0) {
-            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'FAIL' -Detail ("{0} URL line(s) not accessible, {1} accessible. See wvdagenturltool_output.txt." -f $inaccessible.Count, $accessible.Count)
+        } elseif ($pr.ToolError) {
+            Write-Host "The tool gave no usable result. The script's own endpoint list is used instead.$hint"
+            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'WARN' -Detail "No usable result: the tool reported '$($pr.ToolError)'.$hint Script used its own endpoint list."
+        } elseif ($pr.NotAccessible.Count -gt 0) {
+            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'FAIL' -Detail ("{0} URL(s) NOT accessible ({1}), {2} accessible. See wvdagenturltool_output.txt." -f $pr.NotAccessible.Count, (($pr.NotAccessible | Select-Object -First 5) -join ', '), $pr.Accessible.Count)
             $toolUsable = $true
-        } elseif ($accessible.Count -gt 0) {
-            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'PASS' -Detail ("{0} URL line(s) accessible, none reported as not accessible." -f $accessible.Count)
+        } elseif ($pr.Recognised -and $pr.Accessible.Count -gt 0 -and (-not $pr.Outcome -or $pr.Outcome -eq 'HealthCheckSucceeded')) {
+            # PASS needs BOTH section headers, at least one accessible URL and a success outcome, so a truncated
+            # or unexpected output can never produce a PASS.
+            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'PASS' -Detail ("{0} URL(s) accessible, none reported as NOT accessible. Wildcard entries are not verified by the tool." -f $pr.Accessible.Count)
             $toolUsable = $true
         } else {
-            $reason = 'its output could not be classified'
-            if ($toolText -match '(?m)^.*failed with:?\s*(.+)$') { $reason = "the tool reported: $($Matches[1].Trim())" }
-            $hint = ''
-            if ($toolText -match 'named pipe' -or -not $isAdmin) { $hint = ' It talks to the RDAgent service, so run it elevated with the agent service running.' }
-            Write-Host "The tool gave no usable result ($reason). The script's own endpoint list is used instead.$hint"
-            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'WARN' -Detail "No usable result: $reason.$hint Script used its own endpoint list. See wvdagenturltool_output.txt."
+            $why = if ($pr.Outcome -and $pr.Outcome -ne 'HealthCheckSucceeded') { "the tool's outcome was '$($pr.Outcome)'" } else { 'its output did not match the expected format (Accessible URLs / NOT Accessible URLs sections)' }
+            Write-Host "The tool's result could not be relied on: $why. The script's own endpoint list is used as well.$hint"
+            Add-Result -Area 'Connectivity' -Check 'Microsoft URL tool' -Status 'WARN' -Detail "Inconclusive: $why.$hint Read wvdagenturltool_output.txt. Script used its own endpoint list."
         }
     } else {
         Write-Host ""
@@ -1086,7 +1220,8 @@ if ($TestConnectivity) {
         $resp = Invoke-WebRequest -Uri 'https://www.microsoft.com' -Method Head -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         $dateHeader = @($resp.Headers['Date'])[0]
         $remote = [datetime]$dateHeader
-        $skew = [math]::Abs(((Get-Date) - $remote).TotalSeconds)
+        $skew = ((Get-Date) - $remote).TotalSeconds
+        if ($skew -lt 0) { $skew = -$skew }   # no [math]::Abs: method calls on it are blocked in Constrained Language Mode
         Write-Host ("Local time {0:HH:mm:ss}, server time {1:HH:mm:ss}, difference about {2:N0} seconds (includes request latency)." -f (Get-Date), $remote, $skew)
         if ($skew -gt 300)     { Add-Result -Area 'Connectivity' -Check 'Clock skew' -Status 'FAIL' -Detail ("About {0:N0} seconds from server time. Over 5 minutes breaks Entra ID / Kerberos / TLS." -f $skew) }
         elseif ($skew -gt 120) { Add-Result -Area 'Connectivity' -Check 'Clock skew' -Status 'WARN' -Detail ("About {0:N0} seconds from server time." -f $skew) }
@@ -1096,7 +1231,7 @@ if ($TestConnectivity) {
         Add-Result -Area 'Connectivity' -Check 'Clock skew' -Status 'WARN' -Detail 'Could not read a Date header (no HTTPS access to www.microsoft.com on this path), skew not measured.'
     }
 
-    # --- 13c. Build the endpoint list --------------------------------------------
+    # --- Build the endpoint list (no heading printed) --------------------------------------------
     $endpoints = @()
     # a. Nerdio
     $endpoints += New-Endpoint $gNerdio 'nmwextensions.blob.core.windows.net' 443 $true 'Always' 'Required' 'Nerdio DSC extension'
@@ -1151,7 +1286,7 @@ if ($TestConnectivity) {
         $run += $ep
     }
 
-    # --- 13d. Run the tests ------------------------------------------------------
+    # --- 13c. Run the tests ------------------------------------------------------
     Write-SubSection "13c. Per-endpoint tests: DNS, TCP, TLS certificate issuer"
     if (-not $script:FullLang) {
         Write-Host "NOTE: Constrained Language Mode - TCP is tested through Test-NetConnection in a job and the"
@@ -1296,7 +1431,7 @@ if ($TestConnectivity) {
         Add-Result -Area 'Connectivity' -Check $checkName -Status $row.Status -Detail $(if ($row.Detail) { $row.Detail } else { 'Reachable.' })
     }
 
-    # --- 13e. SSL inspection verdict, CSV ----------------------------------------
+    # --- 13d. SSL inspection verdict, CSV ----------------------------------------
     Write-SubSection "13d. SSL inspection verdict"
     $captured  = @($connectivityRows | Where-Object { $_.CertIssuer })
     $inspected = @($connectivityRows | Where-Object { $_.SslInspection -like 'YES*' -and $_.Requirement -eq 'Required' })
@@ -1397,12 +1532,23 @@ Write-Host "endpoints cannot be seen from here. A WARN usually means the result 
 # ---------- Wrap up ----------
 Write-Section "Diagnostic complete"
 Write-Host "Output directory: $workDir"
+Write-Host ""
+Write-Host "Before you send the ZIP: it contains the computer name, the signed-in user name, Defender exclusion paths,"
+if ($ExcludeSensitiveData) {
+    Write-Host "and (with -TestConnectivity) resolved IP addresses and any storage account names you supplied. The gpresult report"
+    Write-Host "and the tenant / device identifiers from dsregcmd were left out (-ExcludeSensitiveData)."
+} else {
+    Write-Host "the gpresult report (users, SIDs, groups, every applied policy), dsregcmd output (tenant ID, device ID, user principal"
+    Write-Host "name) and, with -TestConnectivity, resolved IP addresses and any storage account names you supplied."
+    Write-Host "Use -ExcludeSensitiveData to leave the GPO report and the identifiers out."
+}
 Stop-Transcript | Out-Null
 
 # Zip everything
 try {
     if (Test-Path $zipFile) { Remove-Item $zipFile -Force }
-    Compress-Archive -Path "$workDir\*" -DestinationPath $zipFile -Force
+    # -LiteralPath so a path containing [ ] is not treated as a wildcard pattern.
+    Compress-Archive -LiteralPath @(Get-ChildItem -LiteralPath $workDir -Force | ForEach-Object { $_.FullName }) -DestinationPath $zipFile -Force
     Write-Host ""
     Write-Host "==========================================="
     Write-Host "ZIP file ready to send back:"
